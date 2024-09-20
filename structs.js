@@ -56,3 +56,7 @@ export const CreateOrder = s.object({
 export const PatchOrder = s.object({
   status: s.enums(STATUSES),
 });
+
+export const PostSavedProduct = s.object({
+  productId: Uuid,
+});

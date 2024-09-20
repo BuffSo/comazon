@@ -3,6 +3,7 @@ dotenv.config();
 import express from 'express';
 import { PrismaClient, Prisma } from '@prisma/client';
 import { assert } from 'superstruct';
+import cors from 'cors';
 import {
   CreateUser,
   PatchUser,
@@ -10,12 +11,19 @@ import {
   PatchProduct,
   CreateOrder,
   PatchOrder,
+  PostSavedProduct,
 } from './structs.js';
+
 
 const prisma = new PrismaClient();
 
 const app = express();
 app.use(express.json());
+
+const corsOptions = {
+  origin: ['http://127.0.0.1:5500', 'http://localhost:5500', 'https://buffso-pandamarket.netlify.app']
+};
+app.use(cors(corsOptions));
 
 function asyncHandler(handler) {
   return async function (req, res) {
@@ -86,7 +94,7 @@ app.get('/users/:id', asyncHandler(async (req, res) => {
 
 app.get('/users/:id/saved-products', asyncHandler(async (req, res) => {
   const { id } = req.params;
-  const {savedProducts } = await prisma.user.findUniqueOrThrow({
+  const { savedProducts } = await prisma.user.findUniqueOrThrow({
     where: { id }, 
     include: {
       savedProducts: true,
@@ -95,6 +103,61 @@ app.get('/users/:id/saved-products', asyncHandler(async (req, res) => {
   });
   res.send(savedProducts);
 }));
+
+app.post('/users/:id/saved-products', asyncHandler(async (req, res) => {
+  assert(req.body, PostSavedProduct);
+  const { id: userId } = req.params;
+  const { productId } = req.body;
+  // 찜 토글
+
+  // 사용자가 찜했는지 확인
+  const { savedProducts } = await prisma.user.findUnique({
+    where: { id: userId },
+    select: {
+      savedProducts: {
+        where: { id: productId }
+      }
+    }
+  });
+
+  const action = savedProducts.length > 0 ? 'disconnect' : 'connect';
+
+  // connect 또는 disconnect를 동적으로 설정
+  // 변수명을 변경하여 충돌 방지
+  const { savedProducts: updatedSavedProducts } = await prisma.user.update({
+    where: { id: userId },
+    data: {
+      savedProducts: {
+        [action]: { id: productId },
+      },
+    },
+    include: {
+      savedProducts: true,
+    }
+  });
+
+  res.send(updatedSavedProducts);
+
+  /*
+  // 찜만하기
+  const { savedProducts } = await prisma.user.update({
+    where: { id: userId }, 
+    data: {
+      savedProducts: {
+        connect: {
+          id: productId,
+        }
+      }
+    },
+    include: {
+      savedProducts: true,
+    }
+
+  });
+  res.send(savedProducts);
+  */
+}));
+
 
 app.get('/users/:id/orders', asyncHandler(async (req, res) => {
   const { id } = req.params;
@@ -264,12 +327,37 @@ app.get('/orders/:id', asyncHandler(async (req, res) => {
   res.send(order);
 }));
 
+
+
+
+// 주문 생성 PromisAll, transaction
 app.post('/orders', asyncHandler(async (req, res) => {
   assert(req.body, CreateOrder);
-  const {orderItems, ...orderFields } = req.body;
+  const { userId, orderItems } = req.body;
+  const productIds = orderItems.map((orderItem) => orderItem.productId);
+  const products = await prisma.product.findMany({
+    where: { id: { in: productIds } },
+  });
+
+  // helper 함수 // JS에서는 함수안에 함수 선언이 가능하다
+  function getQuantity(productId) {
+    const orderItem = orderItems.find((orderItem) => orderItem.productId == productId)
+    return orderItem.quantity;
+  }
+  
+  //재고 확인
+  const isSufficientStock = products.every((product) => {
+    const { id, stock } = product;
+    return stock >= getQuantity(id);
+  });
+
+  if(!isSufficientStock) {
+    throw new Error('Insufficient Stock');
+  }
+/*
   const order = await prisma.order.create({
     data: {
-      ...orderFields,
+      userId,
       orderItems: {
         create: orderItems,
       },
@@ -278,6 +366,38 @@ app.post('/orders', asyncHandler(async (req, res) => {
       orderItems: true,
     },
   });
+*/  
+  const queryPromises = productIds.map(
+    (productId) => 
+    prisma.product.update({
+      where: { id: productId },
+      data: {
+        stock: {
+          decrement: getQuantity(productId),
+        },
+      },
+    }) // Promise 메소드 호출 결과 반환값
+  );
+
+  // 트랜잭션 : 실행할 쿼리들을 배열형태로 전달 : 배열에 promise 를 넣어준다.
+  // $transaction 은 Promise all 과 비슷하며 배열을 리턴한다.
+  const [order] = await prisma.$transaction([
+    prisma.order.create({
+      data: {
+        userId,
+        orderItems: {
+          create: orderItems,
+        },
+      },
+      include: {
+        orderItems: true,
+      },
+    }),
+    ...queryPromises,    
+  ]);
+
+  //await Promise.all(queryPromises);
+  
   res.status(201).send(order);
 }));
 
@@ -296,5 +416,6 @@ app.delete('/orders/:id', asyncHandler(async (req, res) => {
   await prisma.order.delete({ where: { id } });
   res.sendStatus(204);
 }));
+
 
 app.listen(process.env.PORT || 3000, () => console.log('Server Started'));
